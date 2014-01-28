@@ -1,0 +1,133 @@
+#!/bin/bash
+
+set -eo pipefail
+
+[ `whoami` != root ] && (
+  echo "Please run this script as ROOT (sudo)."
+  exit 1
+)
+
+SELF=`which "$0"`
+TEMPLATE_BASE=/usr/share/$(basename $SELF)/templates
+WWW_DIR=$HOME/www
+SRC_DIR=`pwd`
+NG_ETC_DIR=/etc/nginx
+HOSTS=/etc/hosts
+
+[ -d $TEMPLATE_BASE ] || mkdir -p $TEMPLATE_BASE
+
+usage() {
+  echo "USAGE: $0 (new|remove|help) (app_name [-t template_name])"
+}
+
+new_app() {
+  APP="$1"
+  TEMPLATE="php"
+  [[ -z "$APP" ]] && (
+    echo "Missing app name."
+    usage
+    exit 1
+  )
+  if [[ "$2" == "-t" ]]; then
+    [[ -z "$3" ]] && (
+      echo "Missing template name."
+      usage
+      exit 1
+    )
+    TEMPLATE="$3"
+  fi
+
+  echo "Setting up ${APP} using ${TEMPLATE} template."
+
+  TEMPLATE="${TEMPLATE_BASE}/${TEMPLATE}.conf"
+  [[ -f "$TEMPLATE"  ]] || (
+    echo "ERROR: $TEMPLATE does not exist!"
+    exit 1
+  )
+
+  echo "----> Linking source to $WWW_DIR..."
+  [ -L "$WWW_DIR/$APP" ] || (
+    pushd $WWW_DIR > /dev/null
+    ln -s $SRC_DIR $APP
+    chown -h $SUDO_USER:$SUDO_USER $APP
+    popd > /dev/null
+  )
+
+  echo "----> Generating config from template..."
+  OUTPUT=`hostname="${APP}.dev" app_root="${WWW_DIR}/${APP}" ruby -e "require 'erb'; puts ERB.new(File.read('${TEMPLATE}')).result"`
+
+  SITE="$NG_ETC_DIR/sites-available/${APP}.dev"
+  echo "----> Writing config to $SITE..."
+
+  echo -e "$OUTPUT" > $SITE
+
+  echo "----> Enabling site..."
+  if [ ! -L "$NG_ETC_DIR/sites-enabled/${APP}.dev" ]; then
+    pushd "$NG_ETC_DIR/sites-enabled" > /dev/null
+    ln -s ../sites-available/${APP}.dev ${APP}.dev
+    popd > /dev/null
+  fi
+
+  echo "----> Adding host entry..."
+  [[ `grep ${APP}.dev ${HOSTS}` ]] || (echo "127.0.0.1 ${APP}.dev" >> $HOSTS)
+
+  echo "----> Reloading NGINX..."
+  service nginx reload || (
+    echo "        Configuration error in NGINX!"
+    cat "$NG_ETC_DIR/sites-available/${APP}.dev"
+    exit 1
+  )
+
+  echo "Done! Visit http://${APP}.dev/"
+}
+
+remove_app() {
+  APP=$1
+  echo "Removing app ${APP}..."
+
+  echo "----> Removing host entry..."
+  sed -i "/${APP}.dev/d" $HOSTS
+
+  echo "----> Disabling site..."
+  rm ${NG_ETC_DIR}/sites-enabled/${APP}.dev || true
+  echo "----> Removing site config..."
+  rm ${NG_ETC_DIR}/sites-available/${APP}.dev || true
+
+  echo "----> Removing www link..."
+  rm "$WWW_DIR/${APP}" || true
+
+  echo "----> Reloading NGINX..."
+  service nginx reload || (
+    echo "        Configuration error in NGINX!"
+    exit 1
+  )
+
+  echo "Done! ${APP} removed."
+}
+
+[ $# -lt 1 ] && usage && exit 1
+
+case "$1" in
+  new)
+    shift
+    new_app $@
+    ;;
+
+  remove)
+    shift
+    echo "Warning: You are about to remove the NGINX config for $1."
+
+    remove_app $@
+    ;;
+
+  --help | help)
+    usage
+    exit 0
+    ;;
+
+    *)
+      echo "Unknown command: '$1'"
+      usage
+      exit 1
+      ;;
+esac
